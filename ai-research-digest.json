@@ -1,0 +1,465 @@
+{
+  "name": "AI Research Digest",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "research-request",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "8dd51f70-f155-4047-8f93-020d696a675e",
+      "name": "Webhook",
+      "webhookId": "4d461e05-6300-4453-8a21-d36dc7cc1d39"
+    },
+    {
+      "parameters": {
+        "url": "=https://export.arxiv.org/api/query?search_query={{ $json.body.topic.trim().split(/\\s+/).map(w => 'all:' + encodeURIComponent(w)).join('+AND+') }}&max_results=5&sortBy=submittedDate&sortOrder=descending",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        208,
+        0
+      ],
+      "id": "b72c9a3b-de19-4a79-b0dc-65ea177dbc73",
+      "name": "HTTP Request"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.xml",
+      "typeVersion": 1,
+      "position": [
+        416,
+        0
+      ],
+      "id": "180bf335-69a0-4438-abbe-70798d4f64ad",
+      "name": "XML"
+    },
+    {
+      "parameters": {
+        "jsCode": "const feed = $input.first().json.feed;\nlet entries = feed.entry || [];\nif (!Array.isArray(entries)) entries = [entries];\n\nconst { topic, email } = $('Webhook').first().json.body;\n\nreturn entries.map(e => {\n  const authors = Array.isArray(e.author) ? e.author : [e.author];\n  const links = Array.isArray(e.link) ? e.link : [e.link];\n  const pdf = links.find(l => l.title === 'pdf');\n  return {\n    json: {\n      topic,\n      email,\n      title: e.title.replace(/\\s+/g, ' ').trim(),\n      authors: authors.map(a => a.name).join(', '),\n      published: e.published.slice(0, 10),\n      summary: e.summary.replace(/\\s+/g, ' ').trim(),\n      url: e.id,\n      pdf: pdf ? pdf.href : null,\n    },\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        0
+      ],
+      "id": "bed4c670-71a6-4ee1-93b2-f038d05fa281",
+      "name": "Clean papers"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You summarise research papers for busy researchers.\n\nResearch topic: {{ $json.topic }}\nTitle: {{ $json.title }}\nAbstract: {{ $json.summary }}\n\nRead the abstract and reply with ONLY one JSON object in exactly this format, with no markdown, no code fences and no extra text:\n\n{\"plain_summary\": \"2-3 sentences that name the dataset, region, method and main numbers from the abstract\", \"method\": \"the main method or model used, in a few words\", \"key_finding\": \"the single most important result, including numbers if the abstract gives them\", \"relevance_score\": 0, \"relevance_reason\": \"one sentence on why this paper matters for the research topic\"}\n\nRules:\n- Fill in every field. Never leave a field out.\n- relevance_score must be a whole number from 1 to 10: 10 means the paper is directly about the research topic, 5 means it is partly related, 1 means it is unrelated. Judge each paper on its own.\n- Use plain text only. Do not use backslashes, LaTeX or maths symbols such as $ or \\sim; write \"about\" or \"approximately\" instead.\n- Use double quotes for all keys and text values.",
+        "messages": {
+          "messageValues": []
+        },
+        "batching": {
+          "batchSize": 1,
+          "delayBetweenBatches": 5000
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        848,
+        0
+      ],
+      "id": "70cfa240-4c10-4cff-9fcc-a91d6d98bcd6",
+      "name": "Basic LLM Chain"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the AI reply for each paper and merge it with the paper's details.\n// Handles code fences, stray backslashes, missing fields and broken JSON.\n\nconst val = (o, k) =>\n  o && o[k] !== undefined && o[k] !== null && String(o[k]).trim() !== ''\n    ? o[k]\n    : 'Not provided';\n\nconst papers = $('Clean papers').all();\n\nreturn $input.all().map((item, i) => {\n  // 1. Get the raw text from the AI\n  let raw = String(item.json.text || '')\n    .replace(/```json|```/g, '')\n    .trim();\n\n  // 2. Keep only the {...} part\n  const start = raw.indexOf('{');\n  const end = raw.lastIndexOf('}');\n  raw = start !== -1 && end > start ? raw.slice(start, end + 1) : '';\n\n  // 3. Fix stray backslashes (e.g. \\sim) that break JSON\n  raw = raw.replace(/\\\\(?![\"\\\\/bfnrtu])/g, '\\\\\\\\');\n\n  // 4. Try to read the JSON\n  let ai = {};\n  let parsed = true;\n  try {\n    ai = JSON.parse(raw);\n  } catch (e) {\n    parsed = false;\n  }\n\n  // 5. Clean the relevance score into a whole number from 1 to 10\n  let score = parseInt(ai.relevance_score, 10);\n  score = Number.isNaN(score) ? null : Math.min(10, Math.max(1, score));\n\n  // 6. Merge with the original paper details\n  const paper = papers[i] ? papers[i].json : {};\n\n  return {\n    json: {\n      ...paper,\n      plain_summary: val(ai, 'plain_summary'),\n      method: val(ai, 'method'),\n      key_finding: val(ai, 'key_finding'),\n      relevance_score: score,\n      relevance_reason: parsed\n        ? val(ai, 'relevance_reason')\n        : 'Could not parse AI output',\n    },\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1232,
+        16
+      ],
+      "id": "084d877a-c190-48e5-99b5-511c301e2296",
+      "name": "Parse AI output"
+    },
+    {
+      "parameters": {
+        "jsCode": "const papers = $input.all().map(i => i.json)\n  .sort((a, b) => (b.relevance_score || 0) - (a.relevance_score || 0));\nconst { topic, email } = papers[0] || {};\nconst esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n\nconst cards = papers.map(p => `\n<div style=\"margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid #ddd\">\n  <h3 style=\"margin:0 0 4px\"><a href=\"${p.url}\">${esc(p.title)}</a></h3>\n  <p style=\"margin:0;color:#555;font-size:13px\">${esc(p.authors)} | ${p.published} | Relevance: ${p.relevance_score ?? 'n/a'}/10</p>\n  <p><b>Summary:</b> ${esc(p.plain_summary)}</p>\n  <p><b>Method:</b> ${esc(p.method)}</p>\n  <p><b>Key finding:</b> ${esc(p.key_finding)}</p>\n  <p><b>Why it matters:</b> ${esc(p.relevance_reason)}</p>\n</div>`).join('');\n\nreturn [{ json: {\n  email,\n  subject: `Research digest: ${topic} (${papers.length} new papers)`,\n  html: `<h2>Research digest: ${esc(topic)}</h2>${cards}`\n} }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1456,
+        16
+      ],
+      "id": "a60176b1-222d-4300-89f6-a3e482cbadf9",
+      "name": "Build digest"
+    },
+    {
+      "parameters": {
+        "fromEmail": "=anitajehu12@gmail.com",
+        "toEmail": "={{ $json.email }}",
+        "subject": "={{ $json.subject }}",
+        "html": "={{ $json.html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1680,
+        16
+      ],
+      "id": "3cbe3a79-2a62-4ae4-9524-840ccc176893",
+      "name": "Send an Email",
+      "webhookId": "7a65801a-f250-4eae-be63-ee4c9537f302",
+      "credentials": {
+        "smtp": {
+          "id": "uwHZspHzIuYP3DY5",
+          "name": "SMTP account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": "allam-2-7b",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        736,
+        208
+      ],
+      "id": "bcfede08-34cc-43ef-8a8b-24991f05b956",
+      "name": "Groq Chat Model",
+      "credentials": {
+        "groqApi": {
+          "id": "jEqDzBvlRKJqCs6d",
+          "name": "Groq account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "18vzMGqFrUXwIbgaR5j0-u5QAtD0WXfwhHg1B8d6O6wU",
+          "mode": "list",
+          "cachedResultName": "AI Research Digest",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/18vzMGqFrUXwIbgaR5j0-u5QAtD0WXfwhHg1B8d6O6wU/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Sheet1",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/18vzMGqFrUXwIbgaR5j0-u5QAtD0WXfwhHg1B8d6O6wU/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "topic": "={{ $json.topic }}",
+            "title": "={{ $json.title }}",
+            "published": "={{ $json.published }}",
+            "authors": "={{ $json.authors }}",
+            "summary": "={{ $json.summary }}",
+            "url": "={{ $json.url }}",
+            "method": "={{ $json.method }}",
+            "key_finding": "={{ $json.key_finding }}",
+            "relevance_score": "={{ $json.relevance_score }}",
+            "relevance_reason": "={{ $json.relevance_reason }}"
+          },
+          "matchingColumns": [
+            "url"
+          ],
+          "schema": [
+            {
+              "id": "topic",
+              "displayName": "topic",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "title",
+              "displayName": "title",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "authors",
+              "displayName": "authors",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "published",
+              "displayName": "published",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "summary",
+              "displayName": "summary",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "url",
+              "displayName": "url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "method",
+              "displayName": "method",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "key_finding",
+              "displayName": "key_finding",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "relevance_score",
+              "displayName": "relevance_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "relevance_reason",
+              "displayName": "relevance_reason",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1440,
+        -224
+      ],
+      "id": "2699fb4b-8e73-4422-a81d-631828c04782",
+      "name": "Append or update row in sheet",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "PYJRevMJLg2K4qhK",
+          "name": "Google Sheets account"
+        }
+      }
+    }
+  ],
+  "pinData": {
+    "Webhook": [
+      {
+        "json": {
+          "headers": {
+            "postman-token": "4a8e0daa-554b-4a38-9309-5e30960357ea",
+            "content-type": "application/json",
+            "content-length": "71",
+            "host": "localhost:5678",
+            "user-agent": "PostmanRuntime/2.12.2",
+            "accept": "*/*",
+            "accept-encoding": "gzip, deflate, br",
+            "connection": "keep-alive"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "topic": "climate downscaling",
+            "email": "anitajehu12@gmail.com"
+          },
+          "webhookUrl": "http://localhost:5678/webhook-test/research-request",
+          "executionMode": "test"
+        },
+        "pairedItem": {
+          "item": 0
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "XML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "XML": {
+      "main": [
+        [
+          {
+            "node": "Clean papers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean papers": {
+      "main": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Basic LLM Chain": {
+      "main": [
+        [
+          {
+            "node": "Parse AI output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse AI output": {
+      "main": [
+        [
+          {
+            "node": "Build digest",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Append or update row in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build digest": {
+      "main": [
+        [
+          {
+            "node": "Send an Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send an Email": {
+      "main": [
+        []
+      ]
+    },
+    "Groq Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append or update row in sheet": {
+      "main": [
+        []
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "versionId": "1431e6ac-44aa-4cda-9f28-2e6cd223eadd",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "c0901e4599a997902ee86b970f01383a22a3f498c243cba06b27cfef400c4ad6"
+  },
+  "id": "VoTfLdGxhTzynJc2",
+  "tags": []
+}
