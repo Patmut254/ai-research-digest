@@ -1,5 +1,7 @@
 # AI Research Digest
 
+Loom demo link: 
+
 An n8n automation that turns a research topic into a ranked, AI-summarised digest of the newest papers on arXiv. It emails the digest and logs every paper to Google Sheets.
 
 Send one request, for example `{"topic": "climate downscaling"}`, and a few seconds later you get an email with the five newest papers, each with a plain-English summary, the method used, the key finding and a relevance score.
